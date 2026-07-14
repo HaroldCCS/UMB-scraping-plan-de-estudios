@@ -478,18 +478,74 @@ async function ensureNightGroups(page) {
   });
 }
 
+// ── Detección de sesión perdida (para que el supervisor reinicie desde 0) ─────
+
+/** True si la página volvió al formulario de login (sesión caída/cerrada). */
+async function isBackAtLogin(page) {
+  for (const frame of page.frames()) {
+    try {
+      const atLogin = await frame.evaluate(
+        () => !!document.querySelector('#codigo, #clave, input[name="clave"], input[name="Submit"]')
+      );
+      if (atLogin) return true;
+    } catch {
+      /* frame navegando: ignorar */
+    }
+  }
+  return false;
+}
+
+/** Error fatal: obliga al supervisor a cerrar Chrome y reiniciar desde 0. */
+class FatalRestart extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "FatalRestart";
+    this.fatal = true;
+  }
+}
+
 // ── Orquestador ──────────────────────────────────────────────────────────────
 
-async function enrollSubjectsModule(page) {
+/**
+ * @param {import('puppeteer').Page} page
+ * @param {{ onStatus?: (status: object) => void }} [options]
+ *   onStatus: callback llamado en cada ciclo con el estado (para el dashboard/log).
+ *
+ * Lanza `FatalRestart` si detecta la sesión caída o demasiados fallos seguidos,
+ * para que el supervisor (index.js) cierre el navegador y reinicie desde cero.
+ */
+async function enrollSubjectsModule(page, options = {}) {
+  const onStatus = typeof options.onStatus === "function" ? options.onStatus : () => {};
   console.log("\n══════ Inscripción automática (inscribir faltantes + migrar a grupo C) ══════");
 
+  const MAX_CONSECUTIVE_FAILURES = 3;
   let cycle = 1;
   let soundPlayed = false;
+  let consecutiveFailures = 0;
+  let lastSubjects = TARGET_SUBJECTS.map((t) => ({
+    code: t.code, name: t.name, group: null, enrolled: false, nocturna: false,
+  }));
+
+  const emit = (extra) => {
+    const status = {
+      state: "running",
+      cycle,
+      subjects: lastSubjects,
+      allEnrolled: lastSubjects.every((s) => s.enrolled),
+      allNight: lastSubjects.every((s) => s.nocturna),
+      done: false,
+      lastError: null,
+      ...extra,
+    };
+    try { onStatus(status); } catch { /* el estado nunca debe tumbar el bucle */ }
+    return status;
+  };
 
   for (;;) {
     console.log(`\n── Ciclo ${cycle} ──`);
     let missing = [];
     let summary = [];
+    let cycleError = null;
 
     try {
       // Fase 1 (cada ciclo): inscribir las materias objetivo que falten.
@@ -498,12 +554,41 @@ async function enrollSubjectsModule(page) {
       // Fase 2 (cada ciclo): lo que ya esté inscrito se intenta migrar a grupo C (nocturno),
       // sin esperar a que estén las 3 (los cupos de C también se liberan en cualquier momento).
       summary = await ensureNightGroups(page);
+      consecutiveFailures = 0; // ciclo sano
     } catch (error) {
+      cycleError = error;
       console.error("  Error en el ciclo:", error.message);
       try {
         await dumpDebugHtml(getMainFrame(page), `debug_ciclo_${cycle}_${Date.now()}.html`);
       } catch { /* diagnóstico opcional */ }
+
+      // ¿Se cayó la sesión? → reinicio total.
+      if (await isBackAtLogin(page).catch(() => false)) {
+        emit({ state: "session-lost", lastError: "Volvió al login" });
+        throw new FatalRestart("Sesión caída: la página volvió al login");
+      }
+
+      consecutiveFailures++;
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        emit({ state: "session-lost", lastError: error.message });
+        throw new FatalRestart(`${consecutiveFailures} fallos seguidos: ${error.message}`);
+      }
       missing = missing.length > 0 ? missing : TARGET_SUBJECTS.map((t) => t.code);
+    }
+
+    // Actualizar el estado conocido de cada materia (si el ciclo produjo summary).
+    if (summary.length > 0) {
+      const byCode = new Map(summary.map((s) => [s.code, s]));
+      lastSubjects = TARGET_SUBJECTS.map((t) => {
+        const s = byCode.get(t.code);
+        return {
+          code: t.code,
+          name: t.name,
+          group: s ? s.group : null,
+          enrolled: s ? !!s.group : !missing.includes(t.code),
+          nocturna: s ? !!s.nocturna : false,
+        };
+      });
     }
 
     // Sonar 5 veces la PRIMERA vez que las 3 queden inscritas.
@@ -515,7 +600,7 @@ async function enrollSubjectsModule(page) {
 
     // Estado del ciclo
     console.log("\n── Estado ──");
-    for (const s of summary) {
+    for (const s of lastSubjects) {
       const estado = s.group
         ? s.nocturna
           ? `grupo ${s.group} ✅ NOCTURNA`
@@ -525,15 +610,18 @@ async function enrollSubjectsModule(page) {
     }
 
     const allEnrolled = missing.length === 0;
-    const allNight = summary.length > 0 && summary.every((s) => s.nocturna);
+    const allNight = lastSubjects.length > 0 && lastSubjects.every((s) => s.nocturna);
+    emit({ allEnrolled, allNight, lastError: cycleError ? cycleError.message : null });
+
     if (allEnrolled && allNight) {
       console.log("\n✅ Objetivo completo: las 3 materias inscritas y en grupo nocturno (C).");
+      emit({ state: "done", done: true, allEnrolled: true, allNight: true });
       break;
     }
 
     const pendientes = [];
     if (!allEnrolled) pendientes.push(`inscribir: ${missing.join(", ")}`);
-    const noNight = summary.filter((s) => s.group && !s.nocturna).map((s) => s.code);
+    const noNight = lastSubjects.filter((s) => s.group && !s.nocturna).map((s) => s.code);
     if (noNight.length > 0) pendientes.push(`migrar a C: ${noNight.join(", ")}`);
     console.log(`\nPendiente → ${pendientes.join(" | ")}`);
     console.log(`Reintentando en ${RETRY_INTERVAL_MS / 1000}s (los cupos pueden liberarse)... (Ctrl+C para detener)`);
@@ -542,6 +630,14 @@ async function enrollSubjectsModule(page) {
       await renavigateToMatricula(page);
     } catch (error) {
       console.error("  Error re-navegando, se reintenta en el próximo ciclo:", error.message);
+      if (await isBackAtLogin(page).catch(() => false)) {
+        emit({ state: "session-lost", lastError: "Login tras re-navegar" });
+        throw new FatalRestart("Sesión caída al re-navegar");
+      }
+      consecutiveFailures++;
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        throw new FatalRestart(`No se pudo re-navegar (${consecutiveFailures} intentos)`);
+      }
     }
     cycle++;
   }

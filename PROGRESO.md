@@ -90,6 +90,29 @@ Dos causas en el modal de grupos:
    `#aceptagrupo` quede habilitado (con un reintento) antes de confirmar.
 Confirmado contra `files/debug_modal_sin_grupos_*.html` (líneas 140-210: radios `gruposopc_N`, botones).
 
+## 2026-07-14 (3) — Auto-reinicio ante crash + dashboard de estado
+Dos funciones nuevas pedidas por Harold:
+
+**1. Supervisor con reinicio desde 0 (`index.js`).**
+- `index.js` ahora es un supervisor: `_runOnce()` hace abrir Chrome → login → navegar → inscribir.
+  Si algo revienta (p.ej. la sesión se cierra), **cierra Chrome y reinicia todo desde cero**
+  (relogin incluido), hasta `_maxRestarts` (100) con espera de 5s entre intentos.
+- El módulo 5 detecta sesión caída: si la página vuelve al login (`#codigo/#clave/Submit`) o hay
+  3 fallos seguidos, lanza `FatalRestart` que burbujea al supervisor para el reinicio limpio.
+- Al terminar con éxito, deja el navegador principal y el monitor ABIERTOS.
+
+**2. Log a archivo + segunda ventana Chrome con dashboard de símbolos.**
+- `utility/logger.js`: redirige `console.log/error` también a `files/log_<timestamp>.txt`.
+- `utility/statusServer.js`: mini servidor HTTP local (`127.0.0.1:4599`) que guarda el último
+  estado en memoria, lo persiste en `files/status.json` y sirve `/status` (JSON) + un
+  mini-dashboard HTML que refresca cada 1s.
+- El módulo 5 recibe `options.onStatus(status)` y lo llama en cada ciclo; el supervisor lo conecta
+  a `statusServer.update`. Estado por materia: `{code,name,group,enrolled,nocturna}`.
+- `index.js._openMonitor()` abre una **segunda ventana de Chrome pequeña** (`--app`, 340x470, arriba
+  a la derecha) apuntando al dashboard. Símbolos: `✓` verde = inscrita+nocturna, `◐` ámbar =
+  inscrita pero NO en C, `✕` rojo = sin inscribir. Cabecera: `●` corriendo / `↻` reiniciando /
+  `⚠` sesión caída / `✓` completado, con heartbeat y nº de ciclo.
+
 ## Notas técnicas
 - Git: 2 commits. Último: `28574a1 test show horarios`.
 - Dependencia única: `puppeteer ^22.13.0`.
