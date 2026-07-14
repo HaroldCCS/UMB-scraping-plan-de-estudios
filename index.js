@@ -28,7 +28,7 @@ class Auto {
   /** Un intento completo: abrir Chrome → login → navegar → inscribir (hasta terminar o crashear). */
   async _runOnce(statusServer) {
     const browser = await puppeteer.launch({
-      headless: false,
+      headless: true,
       args: ["--window-size=1280,900", "--window-position=0,0"],
     });
 
