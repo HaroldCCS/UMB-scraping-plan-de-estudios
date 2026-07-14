@@ -1,6 +1,6 @@
 const puppeteer = require("puppeteer");
 
-const {loginModule, leftFrameModule, getIntoRegistroAcademicoModule, showAndProcessCalendarModule} = require("./modules");
+const {loginModule, leftFrameModule, getIntoRegistroAcademicoModule, enrollSubjectsModule} = require("./modules");
 
 class Auto {
   _url = "https://aulanet.umb.edu.co/aulanet_jh/";
@@ -32,17 +32,24 @@ class Auto {
     //step 3
     await getIntoRegistroAcademicoModule(page);
 
-    //step 4
-    await showAndProcessCalendarModule(page);
+    //step 4: inscripción automática de materias (ver CLAUDE.md)
+    await enrollSubjectsModule(page);
 
-    await browser.close();
+    // El navegador queda abierto a propósito para verificación manual (decisión en CLAUDE.md).
   }
 }
 
-//leer parametros de linea de comandos
+//leer parametros de linea de comandos (con respaldo en variables de entorno)
 const args = process.argv.slice(2);
-const username = args[0];
-const password = args[1];
+const username = args[0] ?? process.env.UMB_USERNAME;
+const password = args[1] ?? process.env.UMB_PASSWORD;
+
+if (!username || !password) {
+  console.error("Faltan las credenciales. Uso:");
+  console.error("  node index.js <codigo_estudiantil> <contraseña>");
+  console.error("o define las variables de entorno UMB_USERNAME y UMB_PASSWORD.");
+  process.exit(1);
+}
 
 const instance = new Auto(username, password);
 instance
