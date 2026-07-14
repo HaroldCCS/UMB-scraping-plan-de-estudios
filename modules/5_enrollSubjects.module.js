@@ -179,6 +179,11 @@ async function readModalGroups(modalFrame) {
       .map((radio, index) => {
         const row = radio.closest("tr");
         if (!row) return null;
+        // Nº de opción del sitio: radio id="gruposopc_N" (o tr id="tdgruposopc_N").
+        // Ese N es el que espera la función nativa selecciona_grupo(N).
+        const m = (radio.id || "").match(/gruposopc_(\d+)/)
+          || (row.id || "").match(/tdgruposopc_(\d+)/);
+        const opt = m ? parseInt(m[1], 10) : null;
         const cells = Array.from(row.querySelectorAll("td")).map((td) =>
           (td.innerText || "").replace(/\s+/g, " ").trim()
         );
@@ -193,43 +198,72 @@ async function readModalGroups(modalFrame) {
             break;
           }
         }
-        return group === null || cupo === null ? null : { index, group, cupo };
+        return group === null || cupo === null ? null : { index, opt, group, cupo };
       })
       .filter((g) => g !== null);
   });
 }
 
-/** Selecciona el radio `index` (0-based sobre los radios visibles) dentro del modal. */
-async function selectModalGroup(modalFrame, index) {
-  await modalFrame.evaluate((idx) => {
-    const radios = Array.from(document.querySelectorAll('input[type="radio"]')).filter((r) => {
-      const rect = r.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0;
-    });
-    if (radios[idx]) radios[idx].click();
-  }, index);
+/**
+ * Selecciona un grupo del modal. Debe disparar la función nativa `selecciona_grupo(N)`
+ * (está en el onclick de la FILA, no del radio) — solo así se habilita el botón de confirmar.
+ * Marcar el radio a secas NO habilita el botón. Devuelve si el botón quedó habilitado.
+ */
+async function selectModalGroup(modalFrame, group) {
+  return modalFrame.evaluate((opt) => {
+    const radio = document.getElementById(`gruposopc_${opt}`);
+    const row = document.getElementById(`tdgruposopc_${opt}`);
+    if (radio) radio.checked = true;
+    if (typeof selecciona_grupo === "function") {
+      selecciona_grupo(opt);
+    } else if (row && typeof row.onclick === "function") {
+      row.onclick();
+    } else if (radio) {
+      radio.click();
+    }
+    const accept = document.getElementById("aceptagrupo");
+    return { selected: !!(radio || row), acceptEnabled: accept ? !accept.disabled : false };
+  }, group.opt);
 }
 
-/** Clic en un botón del modal por texto ("Aceptar" o "Cancelar"). */
+/**
+ * Clic en un botón del modal de grupos.
+ *  - Confirmar → id fijo `#aceptagrupo` (onclick guardar_datos). OJO: su texto cambia
+ *    ("Aceptar" al inscribir, "Editar" al modificar), por eso se ubica por id, no por texto.
+ *    Además arranca deshabilitado hasta seleccionar un grupo.
+ *  - Cancelar  → id fijo `#cancelagrupo`.
+ */
 async function clickModalButton(modalFrame, label) {
-  const clicked = await modalFrame.evaluate((label) => {
+  const wantAccept = /acept|editar|guardar/i.test(label);
+  const result = await modalFrame.evaluate((wantAccept) => {
+    if (wantAccept) {
+      const btn = document.getElementById("aceptagrupo");
+      if (btn) {
+        if (btn.disabled) return { ok: false, reason: "boton confirmar deshabilitado (grupo no seleccionado)" };
+        btn.click();
+        return { ok: true, used: "#aceptagrupo", value: btn.value };
+      }
+    } else {
+      const btn = document.getElementById("cancelagrupo");
+      if (btn) { btn.click(); return { ok: true, used: "#cancelagrupo" }; }
+    }
+    // Respaldo: por texto (incluye "Editar"/"Guardar" como sinónimos de confirmar).
+    const words = wantAccept ? ["aceptar", "editar", "guardar"] : ["cancelar"];
     const matches = (el) => {
-      const text = ((el.innerText || "") + " " + (el.value || "")).toLowerCase();
-      return text.includes(label.toLowerCase());
+      const t = ((el.innerText || "") + " " + (el.value || "")).toLowerCase();
+      return words.some((w) => t.includes(w));
     };
-    const candidates = Array.from(
+    const cand = Array.from(
       document.querySelectorAll('button, input[type="button"], input[type="submit"], a')
     ).filter((el) => {
-      const rect = el.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0 && matches(el);
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0 && matches(el) && !el.disabled;
     });
-    if (candidates.length > 0) {
-      candidates[0].click();
-      return true;
-    }
-    return false;
-  }, label);
-  if (!clicked) throw new Error(`No encontré el botón "${label}" en el modal`);
+    if (cand.length > 0) { cand[0].click(); return { ok: true, used: "texto" }; }
+    return { ok: false, reason: "no encontrado" };
+  }, wantAccept);
+  if (!result.ok) throw new Error(`No pude clicar "${label}" en el modal: ${result.reason}`);
+  return result;
 }
 
 /** Guarda el HTML del frame para depurar cuando algo no coincide con lo esperado. */
@@ -274,9 +308,15 @@ async function resolveGroupModal(page, preference, subjectLabel) {
     return { enrolled: false, group: null, reason: "Sin cupos en los grupos permitidos" };
   }
 
-  await selectModalGroup(modalFrame, chosen.index);
-  await sleep(500);
-  await clickModalButton(modalFrame, "Aceptar");
+  const sel = await selectModalGroup(modalFrame, chosen);
+  await sleep(700); // dar tiempo a que selecciona_grupo habilite el botón de confirmar
+  if (!sel.acceptEnabled) {
+    // Reintento: volver a disparar la selección por si el habilitado tardó.
+    await selectModalGroup(modalFrame, chosen);
+    await sleep(700);
+  }
+  const clickInfo = await clickModalButton(modalFrame, "Aceptar");
+  console.log(`  Confirmado grupo ${chosen.group} (botón "${clickInfo.value || clickInfo.used}")`);
   // El sitio puede lanzar un dialog de confirmación: ya se acepta automáticamente
   // (page.on("dialog") registrado en el flujo de navegación).
   await sleep(STEP_PAUSE_MS + 2_000);
@@ -339,9 +379,17 @@ async function enrollMissingSubjects(page) {
   return TARGET_SUBJECTS.filter((t) => !afterCodes.has(t.code)).map((t) => t.code);
 }
 
-/** Clic en el lápiz (editar) de una materia inscrita, por código. */
+/**
+ * Clic en el lápiz (EDITAR) de una materia inscrita, por código.
+ *
+ * ⚠️ La columna "Acción" tiene DOS celdas/enlaces separados, en este orden:
+ *      lápiz → <a href="javascript:selecciona_materia(..,1)"><img src="edita.gif">   ← EDITAR
+ *      X     → <a href="javascript:selecciona_materia(..,2)"><img src="elimina.gif"> ← ELIMINAR (¡NO tocar!)
+ * El bug anterior usaba `td:last-child`, que es la celda de la X → borraba la materia.
+ * Ahora se apunta explícitamente al enlace de `edita.gif` (4º parámetro = 1) y jamás a `elimina.gif`.
+ */
 async function clickEditEnrolledSubject(frame, code) {
-  const clicked = await frame.evaluate(
+  const result = await frame.evaluate(
     ({ tableSelector, code }) => {
       const rows = Array.from(document.querySelectorAll(`${tableSelector} tr`));
       for (const row of rows) {
@@ -349,19 +397,47 @@ async function clickEditEnrolledSubject(frame, code) {
           (td.innerText || "").replace(/\s+/g, " ").trim()
         );
         if (!cells.some((c) => c === code)) continue;
-        // Columna Acción: el primer elemento clicable es el lápiz (el segundo es la X de eliminar).
-        const actionCell = row.querySelector("td:last-child") || row;
-        const clickable = actionCell.querySelector("a, img, input[type=image], button");
-        if (clickable) {
-          clickable.click();
-          return true;
+
+        const describe = (a) => {
+          const img = a.querySelector("img");
+          const src = ((img && img.getAttribute("src")) || "").toLowerCase();
+          const href = (a.getAttribute("href") || "").toLowerCase();
+          return { src, href };
+        };
+        const isDelete = (a) => {
+          const { src, href } = describe(a);
+          return src.includes("elimina") || /,\s*2\s*\)/.test(href);
+        };
+        const isEdit = (a) => {
+          const { src, href } = describe(a);
+          return (src.includes("edita") || /,\s*1\s*\)/.test(href)) && !isDelete(a);
+        };
+
+        const anchors = Array.from(row.querySelectorAll("a"));
+        const editAnchor = anchors.find(isEdit);
+        if (editAnchor) {
+          editAnchor.click();
+          return { ok: true };
         }
+        // No se pudo identificar con certeza el lápiz: NO se hace clic para evitar
+        // borrar la materia por accidente. Se reporta lo que había en la fila.
+        return {
+          ok: false,
+          reason: "no-edit-anchor",
+          anchors: anchors.map(describe),
+        };
       }
-      return false;
+      return { ok: false, reason: "row-not-found" };
     },
     { tableSelector: SELECTED_TABLE, code }
   );
-  if (!clicked) throw new Error(`No encontré el lápiz de edición para ${code}`);
+
+  if (!result.ok) {
+    if (result.anchors) {
+      console.log(`  [debug] enlaces de la fila ${code}:`, JSON.stringify(result.anchors));
+    }
+    throw new Error(`No pude hacer clic seguro en el lápiz de ${code} (${result.reason})`);
+  }
 }
 
 /**

@@ -68,6 +68,28 @@ El módulo tiene varias funciones; en `showAndProcessCalendarModule` se elige cu
   Si algo no coincide, guarda `files/debug_*.html` para ajustar.
 - `index.js` ahora ejecuta el módulo 5 en el paso 4 (el módulo 4 experimental sigue disponible).
 
+## Fix 2026-07-14 — Editar clicaba la X (eliminaba la materia)
+Síntoma: al migrar una materia fuera de grupo `C`, la Fase 2 daba clic en la **X** (eliminar) en vez del **lápiz**.
+Causa: en `clickEditEnrolledSubject` se usaba `row.querySelector("td:last-child")`. La columna Acción son
+**dos celdas separadas**: penúltima = lápiz (`<img src="edita.gif">`, `selecciona_materia(..,1)`), última = X
+(`<img src="elimina.gif">`, `selecciona_materia(..,2)`). `td:last-child` caía en la X → borraba la materia.
+Fix: la función ahora busca el `<a>` cuyo `img` es `edita.gif` (o href con 4º parámetro `1`) y excluye
+`elimina.gif`/param `2`. Si no identifica el lápiz con certeza, **lanza error y NO hace clic** (evita borrados
+accidentales) y vuelca los enlaces de la fila al log. Confirmado contra `files/debug_modal_sin_grupos_*.html`.
+
+## Fix 2026-07-14 (2) — No daba "Aceptar" tras elegir el cupo
+Síntoma: seleccionaba el grupo pero no confirmaba (no clicaba Aceptar).
+Dos causas en el modal de grupos:
+1. El botón de confirmar es `<input id="aceptagrupo" onclick="guardar_datos()">` y su **texto cambia**:
+   "Aceptar" al inscribir, **"Editar"** al modificar. `clickModalButton` lo buscaba por el texto
+   "aceptar" → no lo hallaba en Fase 2. Ahora se ubica por **id** `#aceptagrupo` (Cancelar = `#cancelagrupo`).
+2. El botón arranca **`disabled`** y solo se habilita al ejecutar la función nativa `selecciona_grupo(N)`,
+   que está en el `onclick` de la **fila** `<tr id="tdgruposopc_N">`, no del radio. El código hacía
+   `radio.click()`, que marca el radio pero no dispara `selecciona_grupo` → botón seguía deshabilitado.
+   Ahora `selectModalGroup` llama a `selecciona_grupo(N)` (N leído del id `gruposopc_N`) y verifica que
+   `#aceptagrupo` quede habilitado (con un reintento) antes de confirmar.
+Confirmado contra `files/debug_modal_sin_grupos_*.html` (líneas 140-210: radios `gruposopc_N`, botones).
+
 ## Notas técnicas
 - Git: 2 commits. Último: `28574a1 test show horarios`.
 - Dependencia única: `puppeteer ^22.13.0`.
